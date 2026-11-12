@@ -4,10 +4,11 @@ mod model;
 mod snapshot;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-use model::{format_timestamp, ChatInfo};
+use clap::{Parser, Subcommand, ValueEnum};
+use model::{format_day_time, format_timestamp, format_timestamp_iso, ChatInfo, Message};
 use rusqlite::Connection;
-use std::{fs, path::PathBuf};
+use serde::Serialize;
+use std::{collections::BTreeMap, fs, io::Write, path::PathBuf};
 
 #[derive(Parser)]
 #[command(version, about = "A searchable local archive for LINE chat history")]
@@ -34,6 +35,110 @@ enum Command {
     },
     Chats,
     Stats,
+    Export {
+        #[arg(long)]
+        chat: Option<String>,
+        #[arg(long, value_enum, default_value_t = ExportFormat::Jsonl)]
+        format: ExportFormat,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ExportFormat {
+    Jsonl,
+    Text,
+}
+
+#[derive(Serialize)]
+struct JsonlRecord<'a> {
+    chat_key: &'a str,
+    chat_name: &'a str,
+    timestamp: String,
+    sender: &'a str,
+    body: &'a str,
+}
+
+fn render_jsonl(messages: &[Message]) -> Result<String> {
+    let mut out = String::new();
+    for m in messages {
+        let record = JsonlRecord {
+            chat_key: &m.chat_key,
+            chat_name: &m.chat_name,
+            timestamp: format_timestamp_iso(m.ts_ms),
+            sender: &m.sender,
+            body: &m.body,
+        };
+        out.push_str(&serde_json::to_string(&record)?);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// LINE-export-like text: a `[LINE] <name>` header per chat, `YYYY/MM/DD`
+/// headings per day, then `HH:MM<TAB>sender<TAB>body`. Bodies keep their
+/// newlines, as in LINE's own exports. Chats are separated by a blank line.
+///
+/// Output is grouped by chat: each chat appears once, ordered by its earliest
+/// message (ties by `chat_key`), with its messages oldest first inside the
+/// group. `messages` is expected oldest-first, so per-chat order is stable.
+fn render_text(messages: &[Message]) -> String {
+    let mut groups: BTreeMap<&str, Vec<&Message>> = BTreeMap::new();
+    for m in messages {
+        groups.entry(m.chat_key.as_str()).or_default().push(m);
+    }
+    let mut groups: Vec<Vec<&Message>> = groups.into_values().collect();
+    fn first<'a>(g: &'a [&'a Message]) -> Option<(i64, &'a str)> {
+        g.first().map(|m| (m.ts_ms, m.chat_key.as_str()))
+    }
+    groups.sort_by(|a, b| first(a).cmp(&first(b)));
+
+    let mut out = String::new();
+    for (i, group) in groups.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        // A chat with no renderable timestamp still gets its header.
+        let label = group
+            .first()
+            .map(|m| {
+                if m.chat_name.is_empty() {
+                    m.chat_key.as_str()
+                } else {
+                    m.chat_name.as_str()
+                }
+            })
+            .unwrap_or_default();
+        out.push_str(&format!("[LINE] {label}\n"));
+        let mut current_day: Option<String> = None;
+        for m in group {
+            let Some((day, time)) = format_day_time(m.ts_ms) else {
+                continue;
+            };
+            if current_day.as_deref() != Some(day.as_str()) {
+                out.push_str(&day);
+                out.push('\n');
+                current_day = Some(day);
+            }
+            out.push_str(&format!("{time}\t{}\t{}\n", m.sender, m.body));
+        }
+    }
+    out
+}
+
+fn write_output(out: Option<&PathBuf>, content: &str) -> Result<()> {
+    match out {
+        Some(path) => {
+            fs::write(path, content).with_context(|| format!("writing {}", path.display()))
+        }
+        None => {
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(content.as_bytes())?;
+            stdout.flush()?;
+            Ok(())
+        }
+    }
 }
 fn date_range(first: Option<i64>, last: Option<i64>) -> String {
     match (first, last) {
@@ -151,6 +256,14 @@ fn run() -> Result<()> {
                 )?;
                 println!("{source}: {count}");
             }
+        }
+        Command::Export { chat, format, out } => {
+            let messages = db::export_messages(&conn, chat.as_deref())?;
+            let content = match format {
+                ExportFormat::Jsonl => render_jsonl(&messages)?,
+                ExportFormat::Text => render_text(&messages),
+            };
+            write_output(out.as_ref(), &content)?;
         }
     }
     Ok(())

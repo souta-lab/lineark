@@ -37,11 +37,11 @@ pub fn search(
 ) -> Result<Vec<Message>> {
     let long = query.chars().count() >= 3;
     let predicate = if long {
-        "m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?1)"
+        "m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH :term)"
     } else {
-        "m.body LIKE '%' || ?1 || '%'"
+        "m.body LIKE '%' || :term || '%'"
     };
-    let sql = format!("SELECT m.chat_key,c.chat_name,m.ts_ms,m.sender,m.body,m.source,m.source_id FROM messages m JOIN chats c USING(chat_key) WHERE {predicate} AND (?2 IS NULL OR c.chat_name LIKE '%' || ?2 || '%' OR c.chat_key LIKE '%' || ?2 || '%') ORDER BY m.ts_ms ASC,m.id ASC LIMIT ?3");
+    let sql = format!("SELECT m.chat_key,c.chat_name,m.ts_ms,m.sender,m.body,m.source,m.source_id FROM messages m JOIN chats c USING(chat_key) WHERE {predicate} AND {CHAT_FILTER} ORDER BY m.ts_ms ASC,m.id ASC LIMIT :limit");
     let term = if long {
         format!("\"{}\"", query.replace('"', "\"\""))
     } else {
@@ -49,19 +49,38 @@ pub fn search(
     };
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
-        params![term, chat, i64::try_from(limit).unwrap_or(i64::MAX)],
-        |r| {
-            Ok(Message {
-                chat_key: r.get(0)?,
-                chat_name: r.get(1)?,
-                ts_ms: r.get(2)?,
-                sender: r.get(3)?,
-                body: r.get(4)?,
-                source: r.get(5)?,
-                source_id: r.get(6)?,
-            })
+        rusqlite::named_params! {
+            ":term": term,
+            ":chat": chat,
+            ":limit": i64::try_from(limit).unwrap_or(i64::MAX),
         },
+        map_message,
     )?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// LIKE substring match on chat name or key; `:chat` NULL matches every chat.
+const CHAT_FILTER: &str =
+    "(:chat IS NULL OR c.chat_name LIKE '%' || :chat || '%' OR c.chat_key LIKE '%' || :chat || '%')";
+
+fn map_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
+    Ok(Message {
+        chat_key: r.get(0)?,
+        chat_name: r.get(1)?,
+        ts_ms: r.get(2)?,
+        sender: r.get(3)?,
+        body: r.get(4)?,
+        source: r.get(5)?,
+        source_id: r.get(6)?,
+    })
+}
+
+/// All messages of the chats matching `chat` (substring of name or key; `None`
+/// = every chat), oldest first.
+pub fn export_messages(conn: &Connection, chat: Option<&str>) -> Result<Vec<Message>> {
+    let sql = format!("SELECT m.chat_key,c.chat_name,m.ts_ms,m.sender,m.body,m.source,m.source_id FROM messages m JOIN chats c USING(chat_key) WHERE {CHAT_FILTER} ORDER BY m.ts_ms ASC,m.id ASC");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::named_params! { ":chat": chat }, map_message)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -119,5 +138,63 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 0);
         }
+    }
+
+    fn message(chat: &ChatInfo, ts_ms: i64, body: &str) -> Message {
+        Message {
+            chat_key: chat.chat_key.clone(),
+            chat_name: chat.chat_name.clone(),
+            ts_ms,
+            sender: "Bob".into(),
+            body: body.into(),
+            source: "export".into(),
+            source_id: None,
+        }
+    }
+
+    #[test]
+    fn export_messages_orders_and_filters() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        let alice = ChatInfo {
+            chat_key: "export:Alice".into(),
+            chat_name: "Alice".into(),
+            chat_type: String::new(),
+        };
+        let group = ChatInfo {
+            chat_key: "c0123abcd".into(),
+            chat_name: "Fictional Group".into(),
+            chat_type: "GROUP".into(),
+        };
+        let base = 1_761_869_520_000; // 2025-10-31 09:12 JST
+                                      // Inserted out of order; the same-ms pair must fall back to id order.
+        import(
+            &mut conn,
+            &alice,
+            &[
+                message(&alice, base + 60_000, "second"),
+                message(&alice, base, "first"),
+            ],
+        )
+        .unwrap();
+        import(
+            &mut conn,
+            &group,
+            &[message(&group, base - 86_400_000, "earlier")],
+        )
+        .unwrap();
+
+        let all = export_messages(&conn, None).unwrap();
+        let bodies: Vec<&str> = all.iter().map(|m| m.body.as_str()).collect();
+        assert_eq!(bodies, ["earlier", "first", "second"]);
+        assert_eq!(all[1].chat_name, "Alice");
+
+        let filtered = export_messages(&conn, Some("Alice")).unwrap();
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().all(|m| m.chat_key == "export:Alice"));
+        // Matching also works on the chat key, like the search --chat filter.
+        assert_eq!(export_messages(&conn, Some("c0123")).unwrap().len(), 1);
+        assert_eq!(export_messages(&conn, Some("Group")).unwrap().len(), 1);
+        assert!(export_messages(&conn, Some("Nobody")).unwrap().is_empty());
     }
 }

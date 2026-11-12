@@ -31,6 +31,7 @@ LINE redistributes only recent history to new clients. Exported phone histories 
 - Deduplicate messages by chat, timestamp, sender, and body.
 - Search Japanese and other text with SQLite FTS5.
 - List chats and archive statistics. Display timestamps in Japan time (UTC+9).
+- Export messages as JSONL or LINE-style text, to stdout or a file.
 
 ## 📦 Install
 
@@ -51,9 +52,17 @@ lineark import-snapshot ./snapshots
 lineark search '明日は' --chat Alice --limit 20
 lineark chats
 lineark stats
+lineark export
+lineark export --format text --chat Alice
+lineark export --format jsonl --out ./alice.jsonl
 ```
 
 The database defaults to `lineark.db`. Set `LINEARK_DB` or use `lineark --db ./archive.db chats` to select another path. Snapshot import reads `.json` files in filename order, without descending into subdirectories; unreadable or invalid files generate warnings and are skipped.
+
+`lineark export` writes all matching messages. JSONL is a single oldest-first stream across chats; text output is grouped by chat (see below). `--chat` filters by substring of chat name or key, like `search --chat`; omit it to export every chat. `--format` is `jsonl` (default) or `text`, and `--out <path>` writes to a file instead of stdout.
+
+- **JSONL:** one object per line with the keys `chat_key`, `chat_name`, `timestamp`, `sender`, and `body`. Timestamps are ISO 8601 in JST, e.g. `"2026-11-12T21:34:00+09:00"`.
+- **Text:** grouped by chat, with chats ordered by their earliest message (ties by chat key). Each chat appears once with a `[LINE] <chat name>` header (the chat key when unnamed), then a `YYYY/MM/DD` heading per day and `HH:MM<TAB>sender<TAB>body` lines, oldest first within the chat. Chats are separated by a blank line. Multiline bodies keep their line breaks, as in LINE's own exports.
 
 ## 🗂️ Data sources
 
