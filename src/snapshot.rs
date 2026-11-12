@@ -10,8 +10,11 @@ struct Snapshot {
 #[derive(Deserialize)]
 struct Chat {
     mid: String,
+    // linejs emits a minimal chat object ({mid, type}) for 1:1 chats and a
+    // full one for groups, so `name` (and defensively `type`) may be absent.
+    #[serde(default)]
     name: String,
-    #[serde(rename = "type")]
+    #[serde(default, rename = "type")]
     chat_type: String,
 }
 #[derive(Deserialize)]
@@ -35,14 +38,14 @@ pub fn parse_snapshot(text: &str) -> Result<(ChatInfo, Vec<Message>)> {
         .messages
         .into_iter()
         .filter_map(|m| {
-            let body = if m.content_type == "NONE" {
-                m.text.unwrap_or_default()
-            } else {
-                format!("[{}]", m.content_type.to_lowercase())
+            // Real text wins whenever a message carries it: CALL entries are
+            // textual summaries ("Call History : ..."), and some FLEX/RICH
+            // exports include alt text. Media without text gets a placeholder.
+            let body = match m.text {
+                Some(text) if !text.is_empty() => text,
+                _ if m.content_type == "NONE" => return None,
+                _ => format!("[{}]", m.content_type.to_lowercase()),
             };
-            if body.is_empty() {
-                return None;
-            }
             Some(Message {
                 chat_key: chat.chat_key.clone(),
                 chat_name: chat.chat_name.clone(),
@@ -68,5 +71,19 @@ mod tests {
         assert_eq!(m.len(), 2);
         assert_eq!(m[0].body, "hello");
         assert_eq!(m[1].body, "[image]");
+    }
+
+    #[test]
+    fn nameless_chat_and_text_carrying_types() {
+        // 1:1 snapshots from linejs have a minimal chat object: no name.
+        let (chat, m) = parse_snapshot(r#"{"chat":{"mid":"u0123abcd","type":"USER"},"messages":[{"id":"1","from":"u0123abcd","contentType":"CALL","text":"Call History : 60000 millisecs, Result: 16","createdTime":1700000000000},{"id":"2","from":"u4567efgh","contentType":"FLEX","createdTime":1700000000001},{"id":"3","from":"u4567efgh","contentType":"STICKER","createdTime":1700000000002}]}"#).unwrap();
+        assert_eq!(chat.chat_key, "u0123abcd");
+        assert_eq!(chat.chat_name, "");
+        assert_eq!(chat.chat_type, "USER");
+        assert_eq!(m.len(), 3);
+        // CALL keeps its textual summary instead of a bare placeholder.
+        assert_eq!(m[0].body, "Call History : 60000 millisecs, Result: 16");
+        assert_eq!(m[1].body, "[flex]");
+        assert_eq!(m[2].body, "[sticker]");
     }
 }

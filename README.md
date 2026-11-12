@@ -55,7 +55,7 @@ The database defaults to `lineark.db`. Set `LINEARK_DB` or use `lineark --db ./a
 
 **Phone exports:** UTF-8 text from LINE's 「トーク履歴を送信」, with a `[LINE] Aliceとのトーク履歴` or group header, date headings, and tab-separated time, sender, and body. BOMs, CRLF endings, multiline messages, and placeholders such as `[写真]` are supported. Chat keys use `export:<chat name>`.
 
-**linejs snapshots:** JSON containing a `chat` object (`mid`, `name`, `type`) and `messages` array (`id`, `from`, `contentType`, `text`, `createdTime`). Extra fields are ignored. Non-text messages become placeholders such as `[image]`; empty NONE messages are skipped. Chat keys use the snapshot chat MID.
+**linejs snapshots:** JSON containing a `chat` object (`mid`, `type`, and `name` when present — 1:1 chats come with a minimal object without one) and `messages` array (`id`, `from`, `contentType`, `text`, `createdTime`). Extra fields are ignored. Messages that carry text keep it (including `CALL` entries, whose text is a call summary); media without text becomes a placeholder such as `[image]`; empty NONE messages are skipped. Chat keys use the snapshot chat MID.
 
 Exports and snapshots keep separate chat identifiers; lineark does not infer that two chats represent the same conversation. Attachments are represented by text placeholders, not downloaded or embedded.
 
